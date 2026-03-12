@@ -1,0 +1,2 @@
+# Reduce churn/conflicts in generated dependency lockfiles.
+Cargo.lock merge=union
