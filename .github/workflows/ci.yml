@@ -20,6 +20,13 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Detect unresolved merge markers
+        run: |
+          if rg -n "^(<<<<<<<|=======|>>>>>>>)" .; then
+            echo "Unresolved merge conflict markers detected"
+            exit 1
+          fi
+
       - name: Format check
         run: cargo fmt --all -- --check
 
