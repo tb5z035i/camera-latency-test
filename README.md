@@ -8,7 +8,7 @@ A Rust tool to estimate RGB camera latency by displaying a fast-changing on-scre
 - GUI stimulus window (egui/eframe) designed for high-frequency visual transitions.
 - Two measurement methods:
   - `luma-step`: alternating dark/light transitions.
-  - `quad-code`: 2x2 coded quadrants (4-bit rolling code) for stronger transition matching.
+  - `quad-code`: 2x2 coded quadrants using 4 grayscale nibbles (16-bit cyclic code space) for robust code-distance latency.
 - Shared timing epoch for stimulus and camera event timestamps.
 - Millisecond-level latency report with summary stats.
 - CSV and JSON export.
@@ -38,6 +38,9 @@ cargo run --release -- \
 - `--duration-s <SECONDS>` test duration.
 - `--method <luma-step|quad-code>` detection strategy.
 - `--luma-threshold <VALUE>` threshold for dark/light detection.
+- `--state-space <N>` cyclic state space size for `quad-code` (default 65536; should be >=50000 for long-delay robustness).
+- `--max-forward-jump-ms <MS>` reject decoded forward code jumps larger than this bound.
+- `--warmup-s <SECONDS>` warmup period before latency sampling starts.
 - `--mode <online|offline>` selects realtime or batch flow.
 - `--offline-runs <N>` number of runs when in offline mode.
 - `--csv-out <PATH>` write per-sample CSV.
@@ -67,6 +70,12 @@ GitHub Actions on `main` builds release binaries and publishes artifacts for:
 
 - **online**: continuous measurement with realtime latency stats shown in the GUI.
 - **offline**: runs multiple fixed-duration measurements and reports aggregated results at the end.
+
+## Measurement notes
+
+- Latency is computed from code-distance between the currently displayed code and the latest decoded camera code, not wallclock correlation.
+- Torn-frame candidates are filtered out when top/bottom ROI decodes disagree; the UI and JSON output include torn-frame ratio.
+- Repeated frames are ignored, backward jumps are discarded, and forward jumps beyond the configured threshold are rejected.
 
 ## Notes
 

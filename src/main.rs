@@ -5,10 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use camera_latency_test::analysis::{
-    build_report, LatencyReport, MeasurementMethod, MeasurementRun, SummaryStats,
-};
-use camera_latency_test::stimulus::{decode_quad_code, state_for};
+use camera_latency_test::analysis::{LatencyReport, MeasurementMethod, SummaryStats};
+use camera_latency_test::stimulus::{cyclic_forward_distance, decode_quad_code, state_for};
 use clap::Parser;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
@@ -36,6 +34,12 @@ struct Cli {
     method: MeasurementMethod,
     #[arg(long, default_value_t = 128.0)]
     luma_threshold: f32,
+    #[arg(long, default_value_t = 65_536)]
+    state_space: u64,
+    #[arg(long, default_value_t = 250.0)]
+    max_forward_jump_ms: f64,
+    #[arg(long, default_value_t = 1.0)]
+    warmup_s: f64,
     #[arg(long, value_enum, default_value_t = RunMode::Offline)]
     mode: RunMode,
     #[arg(long, default_value_t = 5)]
@@ -72,17 +76,10 @@ impl RoiNorm {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct DisplayEvent {
+struct LatencySamplePoint {
     run: u32,
-    id: u64,
-    ms: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CameraEvent {
-    run: u32,
-    id: u64,
-    ms: f64,
+    code: u64,
+    latency_ms: f64,
 }
 
 #[derive(Clone)]
@@ -98,12 +95,16 @@ struct SharedState {
     current_transition_id: u64,
     current_run: u32,
     capture_active: bool,
-    display_events: Vec<DisplayEvent>,
-    camera_events: Vec<CameraEvent>,
     run_started: bool,
     run_finished: bool,
     latest_preview: Option<PreviewFrame>,
     detection_roi: Option<RoiNorm>,
+    latency_samples: Vec<LatencySamplePoint>,
+    total_camera_frames: u64,
+    torn_frames: u64,
+    repeated_frames: u64,
+    backward_frames: u64,
+    jump_rejected_frames: u64,
 }
 
 impl SharedState {
@@ -113,12 +114,16 @@ impl SharedState {
             current_transition_id: 0,
             current_run: 0,
             capture_active: false,
-            display_events: Vec::new(),
-            camera_events: Vec::new(),
             run_started: false,
             run_finished: false,
             latest_preview: None,
             detection_roi: None,
+            latency_samples: Vec::new(),
+            total_camera_frames: 0,
+            torn_frames: 0,
+            repeated_frames: 0,
+            backward_frames: 0,
+            jump_rejected_frames: 0,
         }
     }
 }
@@ -130,6 +135,10 @@ struct ResultEnvelope {
     report: LatencyReport,
     per_run_stats: Vec<Option<SummaryStats>>,
     notice: String,
+    torn_frame_ratio: f64,
+    repeated_frames: u64,
+    backward_frames: u64,
+    jump_rejected_frames: u64,
 }
 
 fn main() -> Result<()> {
@@ -166,7 +175,7 @@ fn main() -> Result<()> {
 
     let locked = state.lock().expect("state lock poisoned").clone();
     let (report, per_run_stats) = build_mode_report(&cli, &locked);
-    persist_results(&cli, &report, &per_run_stats)?;
+    persist_results(&cli, &locked, &report, &per_run_stats)?;
     Ok(())
 }
 
@@ -205,25 +214,29 @@ fn build_mode_report(cli: &Cli, state: &SharedState) -> (LatencyReport, Vec<Opti
 }
 
 fn build_report_for_run(state: &SharedState, run: u32) -> LatencyReport {
-    let measurement_run = MeasurementRun {
-        display_events_ms: state
-            .display_events
-            .iter()
-            .filter(|e| e.run == run)
-            .map(|e| (e.id, e.ms))
-            .collect(),
-        camera_events_ms: state
-            .camera_events
-            .iter()
-            .filter(|e| e.run == run)
-            .map(|e| (e.id, e.ms))
-            .collect(),
-    };
-    build_report(&measurement_run)
+    let samples: Vec<camera_latency_test::analysis::LatencySample> = state
+        .latency_samples
+        .iter()
+        .filter(|s| s.run == run)
+        .map(|s| camera_latency_test::analysis::LatencySample {
+            transition_id: s.code,
+            display_ms: 0.0,
+            camera_ms: s.latency_ms,
+            latency_ms: s.latency_ms,
+        })
+        .collect();
+
+    LatencyReport {
+        stats: camera_latency_test::analysis::summarize(&samples),
+        dropped_display_events: 0,
+        dropped_camera_events: 0,
+        samples,
+    }
 }
 
 fn persist_results(
     cli: &Cli,
+    state: &SharedState,
     report: &LatencyReport,
     per_run_stats: &[Option<SummaryStats>],
 ) -> Result<()> {
@@ -235,12 +248,22 @@ fn persist_results(
         wtr.flush()?;
     }
 
+    let torn_ratio = if state.total_camera_frames == 0 {
+        0.0
+    } else {
+        state.torn_frames as f64 / state.total_camera_frames as f64
+    };
+
     let envelope = ResultEnvelope {
         mode: cli.mode,
         offline_runs: cli.offline_runs.max(1),
         report: report.clone(),
         per_run_stats: per_run_stats.to_vec(),
-        notice: "Select ROI in camera view so the detector only tracks the displayed pattern. Disable AE if possible.".into(),
+        notice: "Latency is derived from code-distance between current displayed code and latest captured code. Torn/repeated/backward/jump-rejected frames are filtered.".into(),
+        torn_frame_ratio: torn_ratio,
+        repeated_frames: state.repeated_frames,
+        backward_frames: state.backward_frames,
+        jump_rejected_frames: state.jump_rejected_frames,
     };
 
     if let Some(path) = &cli.json_out {
@@ -265,7 +288,9 @@ fn camera_capture_loop(
     camera.open_stream()?;
 
     let mut last_seen_run: Option<u32> = None;
-    let mut last_seen_id: Option<u64> = None;
+    let mut last_seen_ids: [Option<u64>; 2] = [None, None];
+    let max_jump_codes =
+        ((cli.max_forward_jump_ms.max(1.0) * cli.stimulus_hz.max(1.0)) / 1000.0).ceil() as u64;
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -285,15 +310,17 @@ fn camera_capture_loop(
         let full_h = image.height() as usize;
         let raw = image.as_raw();
 
-        let (capture_active, run_started, run_finished, current_run, roi) = {
+        let (capture_active, run_started, run_finished, current_run, roi, current_transition_id) = {
             let mut guard = state.lock().expect("state lock poisoned");
             guard.latest_preview = Some(build_preview(raw, full_w, full_h, 640));
+            guard.total_camera_frames += 1;
             (
                 guard.capture_active,
                 guard.run_started,
                 guard.run_finished,
                 guard.current_run,
                 guard.detection_roi,
+                guard.current_transition_id,
             )
         };
 
@@ -303,37 +330,74 @@ fn camera_capture_loop(
 
         if last_seen_run != Some(current_run) {
             last_seen_run = Some(current_run);
-            last_seen_id = None;
+            last_seen_ids = [None, None];
         }
 
         let Some(roi) = roi else {
             continue;
         };
 
-        let id = detect_transition_id(
+        let decoded = detect_transition_id(
             cli.method,
             cli.luma_threshold,
             raw,
             full_w,
             full_h,
             roi,
-            last_seen_id,
+            last_seen_ids[0],
+            cli.state_space,
+            max_jump_codes,
         );
 
-        if let Some(id) = id {
+        if decoded.torn {
+            let mut guard = state.lock().expect("state lock poisoned");
+            guard.torn_frames += 1;
+            continue;
+        }
+
+        if let Some(id) = decoded.id {
             let mut guard = state.lock().expect("state lock poisoned");
             if !guard.capture_active || guard.current_run != current_run || guard.run_finished {
                 continue;
             }
-            if guard.camera_events.last().map(|e| (e.run, e.id)) != Some((current_run, id)) {
-                let ms = guard.epoch.elapsed().as_secs_f64() * 1000.0;
-                guard.camera_events.push(CameraEvent {
-                    run: current_run,
-                    id,
-                    ms,
-                });
-                last_seen_id = Some(id);
+
+            if guard.epoch.elapsed().as_secs_f64() < cli.warmup_s.max(0.0) {
+                last_seen_ids = [Some(id), last_seen_ids[0]];
+                continue;
             }
+
+            if last_seen_ids[0] == Some(id) {
+                guard.repeated_frames += 1;
+                continue;
+            }
+
+            if let Some(prev) = last_seen_ids[0] {
+                let forward = cyclic_forward_distance(prev, id, cli.state_space.max(2));
+                if forward == 0 {
+                    guard.repeated_frames += 1;
+                    continue;
+                }
+                if forward > max_jump_codes.max(1) {
+                    guard.jump_rejected_frames += 1;
+                    continue;
+                }
+            }
+
+            let current_display = current_transition_id % cli.state_space.max(2);
+            let delta_codes = cyclic_forward_distance(id, current_display, cli.state_space.max(2));
+            if delta_codes > ((5.0 * cli.stimulus_hz.max(1.0)).ceil() as u64) {
+                guard.backward_frames += 1;
+                continue;
+            }
+
+            let step_ms = 1000.0 / cli.stimulus_hz.max(1.0);
+            let latency_ms = delta_codes as f64 * step_ms;
+            guard.latency_samples.push(LatencySamplePoint {
+                run: current_run,
+                code: id,
+                latency_ms,
+            });
+            last_seen_ids = [Some(id), last_seen_ids[0]];
         }
     }
 
@@ -373,6 +437,11 @@ fn build_preview(raw: &[u8], width: usize, height: usize, max_w: usize) -> Previ
     }
 }
 
+struct FrameDecode {
+    id: Option<u64>,
+    torn: bool,
+}
+
 fn detect_transition_id(
     method: MeasurementMethod,
     luma_threshold: f32,
@@ -381,9 +450,14 @@ fn detect_transition_id(
     height: usize,
     roi: RoiNorm,
     previous_id: Option<u64>,
-) -> Option<u64> {
+    state_space: u64,
+    max_forward_jump_codes: u64,
+) -> FrameDecode {
     if width < 4 || height < 4 {
-        return None;
+        return FrameDecode {
+            id: None,
+            torn: false,
+        };
     }
 
     let roi = roi.clamp();
@@ -395,16 +469,16 @@ fn detect_transition_id(
     let rw = x1.saturating_sub(x0).max(2);
     let rh = y1.saturating_sub(y0).max(2);
 
-    let sample = |qx: usize, qy: usize| -> f32 {
+    let sample = |qx: usize, qy: usize, y_shift: usize| -> f32 {
         let x = if qx == 0 {
             x0 + rw / 4
         } else {
             x0 + (3 * rw) / 4
         };
         let y = if qy == 0 {
-            y0 + rh / 4
+            y0 + rh / 4 + y_shift
         } else {
-            y0 + (3 * rh) / 4
+            y0 + (3 * rh) / 4 + y_shift
         };
         let x = x.min(width - 1);
         let y = y.min(height - 1);
@@ -420,17 +494,44 @@ fn detect_transition_id(
 
     match method {
         MeasurementMethod::LumaStep => {
-            let luma = sample(0, 0);
+            let luma = sample(0, 0, 0);
             let bit = if luma > luma_threshold { 1 } else { 0 };
-            match previous_id {
+            let id = match previous_id {
                 None => Some(bit),
                 Some(prev) if prev % 2 == bit => None,
                 Some(prev) => Some(prev + 1),
-            }
+            };
+            FrameDecode { id, torn: false }
         }
         MeasurementMethod::QuadCode => {
-            let lumas = [sample(0, 0), sample(1, 0), sample(0, 1), sample(1, 1)];
-            decode_quad_code(lumas, luma_threshold, previous_id)
+            let lumas = [
+                sample(0, 0, 0),
+                sample(1, 0, 0),
+                sample(0, 1, 0),
+                sample(1, 1, 0),
+            ];
+            let id = decode_quad_code(lumas, previous_id, state_space, max_forward_jump_codes);
+
+            let split = (rh / 8).max(1);
+            let top_lumas = [
+                sample(0, 0, 0),
+                sample(1, 0, 0),
+                sample(0, 1, 0),
+                sample(1, 1, 0),
+            ];
+            let bottom_lumas = [
+                sample(0, 0, split),
+                sample(1, 0, split),
+                sample(0, 1, split),
+                sample(1, 1, split),
+            ];
+            let top = decode_quad_code(top_lumas, None, state_space, state_space - 1);
+            let bottom = decode_quad_code(bottom_lumas, None, state_space, state_space - 1);
+
+            FrameDecode {
+                id,
+                torn: top.is_some() && bottom.is_some() && top != bottom,
+            }
         }
     }
 }
@@ -511,10 +612,6 @@ impl App {
 
         let mut guard = self.state.lock().expect("state lock poisoned");
         if guard.capture_active && !guard.run_finished && self.last_tick.elapsed() >= self.period {
-            let id = guard.current_transition_id;
-            let ms = guard.epoch.elapsed().as_secs_f64() * 1000.0;
-            let run = guard.current_run;
-            guard.display_events.push(DisplayEvent { run, id, ms });
             guard.current_transition_id += 1;
             self.last_tick = Instant::now();
         }
@@ -538,7 +635,7 @@ impl eframe::App for App {
                 guard.capture_active,
             )
         };
-        let stimulus = state_for(self.cli.method, current_id);
+        let stimulus = state_for(self.cli.method, current_id, self.cli.state_space);
         let (preview_opt, roi_opt) = self.preview_image_and_roi();
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -606,6 +703,28 @@ impl eframe::App for App {
                         current_run + 1
                     ));
                     ui.label(format!("Transition #{}", stimulus.transition_id));
+                    let counters = {
+                        let guard = self.state.lock().expect("state lock poisoned");
+                        (
+                            guard.total_camera_frames,
+                            guard.torn_frames,
+                            guard.repeated_frames,
+                            guard.jump_rejected_frames,
+                        )
+                    };
+                    let torn_ratio = if counters.0 == 0 {
+                        0.0
+                    } else {
+                        counters.1 as f64 / counters.0 as f64
+                    };
+                    ui.label(format!(
+                        "Torn ratio {:.2}% ({} / {}), repeated {}, jump-rejected {}",
+                        torn_ratio * 100.0,
+                        counters.1,
+                        counters.0,
+                        counters.2,
+                        counters.3
+                    ));
                     if roi_opt.is_none() {
                         ui.colored_label(
                             egui::Color32::YELLOW,
