@@ -1,0 +1,32 @@
+[package]
+name = "camera-latency-test"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "camera_latency_test"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "camera-latency-test"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+csv = "1"
+eframe = { version = "0.27", default-features = true }
+egui = "0.27"
+nokhwa = { version = "0.10", features = ["input-native"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
+
+[features]
+default = []
+python = ["pyo3"]
+
+[dev-dependencies]
+approx = "0.5"
